@@ -3,7 +3,7 @@ Triton Rotary Position Embeddings (RoPE)
 End-to-end implementation using Triton kernels
 
 *** STUDENT ASSIGNMENT ***
-Fill in the TODO sections to implement RoPE using Triton kernels
+Filled TODO sections to implement RoPE using Triton kernels
 """
 
 from typing import Optional, Tuple
@@ -42,62 +42,36 @@ def compute_freqs_kernel(
 ):
     """
     Compute cos and sin for rotary embeddings.
-
-    *** TODO: Implement this kernel ***
-
     Grid: (seq_len,)
     """
+    # 每个 program 处理序列中的一个位置 (position)
     pid = tl.program_id(0)
 
-    # ============================================================================
-    # TODO: Implement frequency computation
-    # ============================================================================
-    #
-    # Step 1: Load position as scalar
-    # Step 2: Load inverse frequencies
-    # Step 3: Compute freqs = position * inv_freq
-    # Step 4: Compute cos and sin
-    # Step 5: Store concatenated cos/sin
-
-    # YOUR CODE HERE
-    # Step 1: Load position as scalar
-    pos = tl.load(positions_ptr + pid * stride_pos).to(tl.float32)
-
-    # Step 2: Load inverse frequencies (half_dim 個元素)
+    # 1. 确定列偏移（处理 dim // 2 的维度）
     offs = tl.arange(0, BLOCK)
     mask = offs < half_dim
+
+    # 2. 加载当前位置索引和对应的逆频率向量
+    # positions_ptr 通常是 [0, 1, 2, ..., seq_len-1]
+    pos = tl.load(positions_ptr + pid * stride_pos)
     inv_freq = tl.load(inv_freq_ptr + offs * stride_inv, mask=mask, other=0.0)
 
-    # Step 3: Compute freqs = position * inv_freq
+    # 3. 计算频率: freqs = pos * inv_freq
     freqs = pos * inv_freq
 
-    # Step 4: Compute cos and sin
+    # 4. 计算 cos 和 sin
     cos_val = tl.cos(freqs)
     sin_val = tl.sin(freqs)
 
-    # Step 5: Store concatenated cos/sin
-    # cos_cache[pid, :half_dim] = cos_val, cos_cache[pid, half_dim:] = cos_val
-    tl.store(
-        cos_ptr + pid * stride_cos0 + offs * stride_cos1,
-        cos_val,
-        mask=mask,
-    )
-    tl.store(
-        cos_ptr + pid * stride_cos0 + (offs + half_dim) * stride_cos1,
-        cos_val,
-        mask=mask,
-    )
-    tl.store(
-        sin_ptr + pid * stride_sin0 + offs * stride_sin1,
-        sin_val,
-        mask=mask,
-    )
-    tl.store(
-        sin_ptr + pid * stride_sin0 + (offs + half_dim) * stride_sin1,
-        sin_val,
-        mask=mask,
-    )
-    #pass
+    # 5. 存储结果到 cache
+    # 根据 RoPE 实现习惯，通常将 cos/sin 复制一份拼接，以便直接与 [x1, x2] 进行向量化运算
+    # 存储前半部分 [0:half_dim]
+    tl.store(cos_ptr + pid * stride_cos0 + offs * stride_cos1, cos_val, mask=mask)
+    tl.store(sin_ptr + pid * stride_sin0 + offs * stride_sin1, sin_val, mask=mask)
+
+    # 存储后半部分 [half_dim:rotary_dim]
+    tl.store(cos_ptr + pid * stride_cos0 + (offs + half_dim) * stride_cos1, cos_val, mask=mask)
+    tl.store(sin_ptr + pid * stride_sin0 + (offs + half_dim) * stride_sin1, sin_val, mask=mask)
 
 
 # ============================================================================
@@ -113,7 +87,6 @@ class RotaryEmbedding:
         max_position_embeddings: int = 8192,
         base: float = 10000.0,
         partial_rotary_factor: float = 1.0,
-        device=None
     ):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
@@ -122,79 +95,31 @@ class RotaryEmbedding:
 
         self.rotary_dim = int(dim * partial_rotary_factor)
         self.rotary_dim = self.rotary_dim - (self.rotary_dim % 2)
-        device = device or torch.device("cpu")
+
+        # 预计算 inv_freq 并存为 Tensor
         inv_freq = 1.0 / (
             base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim)
         )
-        self._half_dim = self.rotary_dim // 2
         self.inv_freq = inv_freq
-        self._block = triton.next_power_of_2(self._half_dim)
 
-        self._update_cache(max_position_embeddings, device=device)
+        self._update_cache(max_position_embeddings)
 
-    # def _update_cache(self, seq_len: int, device: Optional[torch.device] = None):
-    #     """Pre-compute cos and sin using Triton kernel."""
-    #     self.max_seq_len_cached = seq_len
-    #     half_dim = self.rotary_dim // 2
-    #     if device is None:
-    #         device = self.inv_freq.device
-
-    #     positions = torch.arange(seq_len, dtype=torch.float32, device=device)
-    #     cos_cache = torch.empty((seq_len, self.rotary_dim), dtype=torch.float32, device=device)
-    #     sin_cache = torch.empty((seq_len, self.rotary_dim), dtype=torch.float32, device=device)
-
-    #     if device.type == "cuda":
-    #         if self.inv_freq.device != device:
-    #             self.inv_freq = self.inv_freq.to(device)
-
-    #         block = triton.next_power_of_2(half_dim)
-    #         compute_freqs_kernel[(seq_len,)](
-    #             positions,
-    #             self.inv_freq,
-    #             cos_cache,
-    #             sin_cache,
-    #             seq_len,
-    #             half_dim,
-    #             positions.stride(0),
-    #             self.inv_freq.stride(0),
-    #             cos_cache.stride(0),
-    #             cos_cache.stride(1),
-    #             sin_cache.stride(0),
-    #             sin_cache.stride(1),
-    #             BLOCK=block,
-    #         )
-    #     else:
-    #         if self.inv_freq.device != device:
-    #             self.inv_freq = self.inv_freq.to(device)
-    #         freqs = positions[:, None] * self.inv_freq[None, :]
-    #         cos_half = torch.cos(freqs)
-    #         sin_half = torch.sin(freqs)
-    #         cos_cache[:, :half_dim] = cos_half
-    #         cos_cache[:, half_dim : half_dim * 2] = cos_half
-    #         sin_cache[:, :half_dim] = sin_half
-    #         sin_cache[:, half_dim : half_dim * 2] = sin_half
-
-    #     self.cos_cached = cos_cache
-    #     self.sin_cached = sin_cache
     def _update_cache(self, seq_len: int, device: Optional[torch.device] = None):
         """Pre-compute cos and sin using Triton kernel."""
         self.max_seq_len_cached = seq_len
-
-        # 問題2修正：使用預先算好的 _half_dim / _block，不在這裡重算
-        half_dim = self._half_dim
-
+        half_dim = self.rotary_dim // 2
         if device is None:
             device = self.inv_freq.device
-
-        # 問題1修正：inv_freq 已在正確 device，只在跨 device 時才 .to()
-        if self.inv_freq.device != device:
-            self.inv_freq = self.inv_freq.to(device)
 
         positions = torch.arange(seq_len, dtype=torch.float32, device=device)
         cos_cache = torch.empty((seq_len, self.rotary_dim), dtype=torch.float32, device=device)
         sin_cache = torch.empty((seq_len, self.rotary_dim), dtype=torch.float32, device=device)
 
         if device.type == "cuda":
+            if self.inv_freq.device != device:
+                self.inv_freq = self.inv_freq.to(device)
+
+            block = triton.next_power_of_2(half_dim)
             compute_freqs_kernel[(seq_len,)](
                 positions,
                 self.inv_freq,
@@ -208,9 +133,12 @@ class RotaryEmbedding:
                 cos_cache.stride(1),
                 sin_cache.stride(0),
                 sin_cache.stride(1),
-                BLOCK=self._block,          # 問題2修正：直接用緩存的 block
+                BLOCK=block,
             )
         else:
+            # CPU 回退逻辑
+            if self.inv_freq.device != device:
+                self.inv_freq = self.inv_freq.to(device)
             freqs = positions[:, None] * self.inv_freq[None, :]
             cos_half = torch.cos(freqs)
             sin_half = torch.sin(freqs)
@@ -256,33 +184,6 @@ def next_power_of_two(x: int) -> int:
 MAX_ROPE_DIM = 256
 
 
-# def _apply_rope_single(
-#     x: torch.Tensor,
-#     cos: torch.Tensor,
-#     sin: torch.Tensor,
-#     half_dim: int,
-#     head_dim: int,
-# ) -> torch.Tensor:
-#     """Apply RoPE to a single tensor (Q or K) using Torch."""
-#     batch, num_heads, seq_len, _ = x.shape
-
-#     cos = cos[:seq_len]
-#     sin = sin[:seq_len]
-
-#     x1 = x[..., :half_dim]
-#     x2 = x[..., half_dim : half_dim * 2]
-
-#     cos_expanded = cos[None, None, :, :]
-#     sin_expanded = sin[None, None, :, :]
-
-#     x1_rot = x1 * cos_expanded - x2 * sin_expanded
-#     x2_rot = x2 * cos_expanded + x1 * sin_expanded
-
-#     if head_dim > half_dim * 2:
-#         x_pass = x[..., half_dim * 2 :]
-#         return torch.cat([x1_rot, x2_rot, x_pass], dim=-1)
-#     return torch.cat([x1_rot, x2_rot], dim=-1)
-
 def _apply_rope_single(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -290,26 +191,31 @@ def _apply_rope_single(
     half_dim: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Apply RoPE to a single tensor (Q or K) using Torch (Optimized)."""
-    seq_len = x.shape[-2]
+    """Apply RoPE to a single tensor (Q or K) using Torch."""
+    batch, num_heads, seq_len, _ = x.shape
 
-    # 直接擴充維度，避免 None 索引產生的額外開銷
-    cos = cos[:seq_len].unsqueeze(0).unsqueeze(0)
-    sin = sin[:seq_len].unsqueeze(0).unsqueeze(0)
+    cos = cos[:seq_len]
+    sin = sin[:seq_len]
+
+    # 将维度拆分为两半：[x1, x2] -> [-x2, x1]
+    cos = cos[:, :half_dim]
+    sin = sin[:, :half_dim]
 
     x1 = x[..., :half_dim]
     x2 = x[..., half_dim : half_dim * 2]
 
-    # 優化：預先配置記憶體，避免 torch.cat 產生的巨大 VRAM 複製成本
-    out = torch.empty_like(x)
-    
-    out[..., :half_dim] = x1 * cos - x2 * sin
-    out[..., half_dim : half_dim * 2] = x2 * cos + x1 * sin
+    cos_expanded = cos[None, None, :, :]
+    sin_expanded = sin[None, None, :, :]
+
+    # RoPE 核心公式: x_rot = x * cos + rotate_half(x) * sin
+    x1_rot = x1 * cos_expanded - x2 * sin_expanded
+    x2_rot = x2 * cos_expanded + x1 * sin_expanded
 
     if head_dim > half_dim * 2:
-        out[..., half_dim * 2 :] = x[..., half_dim * 2 :]
-        
-    return out
+        x_pass = x[..., half_dim * 2 :]
+        return torch.cat([x1_rot, x2_rot, x_pass], dim=-1)
+    return torch.cat([x1_rot, x2_rot], dim=-1)
+
 
 def apply_rotary_pos_emb(
     q: torch.Tensor,
@@ -318,9 +224,7 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     rotary_dim: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary position embeddings.
-    """
+    """Apply rotary position embeddings."""
     batch, num_q_heads, seq_len, head_dim = q.shape
     _, num_kv_heads, _, _ = k.shape
 
@@ -329,19 +233,14 @@ def apply_rotary_pos_emb(
 
     half_dim = rotary_dim // 2
 
-    if cos.shape[1] > half_dim:
-        cos = cos[:, :half_dim]
-        sin = sin[:, :half_dim]
+    # 截断 cos/sin 到需要的维度
+    if cos.shape[1] > half_dim * 2:
+        # 注意：这里的逻辑需匹配存储时的拼接方式
+        cos = cos[:, :half_dim * 2]
+        sin = sin[:, :half_dim * 2]
 
-    # Avoid a redundant copy when cos/sin are already float32 and contiguous
-    if cos.dtype != torch.float32:
-        cos = cos.to(torch.float32)
-    if sin.dtype != torch.float32:
-        sin = sin.to(torch.float32)
-    if not cos.is_contiguous():
-        cos = cos.contiguous()
-    if not sin.is_contiguous():
-        sin = sin.contiguous()
+    cos = cos.to(torch.float32).contiguous()
+    sin = sin.to(torch.float32).contiguous()
 
     q_out = _apply_rope_single(q, cos, sin, half_dim, head_dim)
     k_out = _apply_rope_single(k, cos, sin, half_dim, head_dim)
@@ -364,28 +263,31 @@ if __name__ == "__main__":
     print("Testing Triton RoPE...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 2
-    num_heads = 4
-    seq_len = 16
-    head_dim = 64
+    if device.type != "cuda":
+        print("CUDA not available, skipping Triton test.")
+    else:
+        batch_size = 2
+        num_heads = 4
+        seq_len = 16
+        head_dim = 64
 
-    rope = RotaryEmbedding(dim=head_dim, max_position_embeddings=1024)
+        rope = RotaryEmbedding(dim=head_dim, max_position_embeddings=1024)
 
-    q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
-    k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+        k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
 
-    cos, sin = rope(q)
-    print(f"Cos shape: {cos.shape}")
-    print(f"Sin shape: {sin.shape}")
+        cos, sin = rope(q)
+        print(f"Cos shape: {cos.shape}")
+        print(f"Sin shape: {sin.shape}")
 
-    q_rot, k_rot = apply_rotary_pos_emb(q, k, cos, sin)
-    print(f"Q rotated shape: {q_rot.shape}")
-    print(f"K rotated shape: {k_rot.shape}")
+        q_rot, k_rot = apply_rotary_pos_emb(q, k, cos, sin)
+        print(f"Q rotated shape: {q_rot.shape}")
+        print(f"K rotated shape: {k_rot.shape}")
 
-    print("\nTesting partial RoPE (50%):")
-    rope_partial = RotaryEmbedding(dim=head_dim, partial_rotary_factor=0.5)
-    cos_p, sin_p = rope_partial(q)
-    q_rot_p, k_rot_p = apply_partial_rotary_pos_emb(q, k, cos_p, sin_p, head_dim // 2)
-    print(f"Q rotated (partial) shape: {q_rot_p.shape}")
+        print("\nTesting partial RoPE (50%):")
+        rope_partial = RotaryEmbedding(dim=head_dim, partial_rotary_factor=0.5)
+        cos_p, sin_p = rope_partial(q)
+        q_rot_p, k_rot_p = apply_partial_rotary_pos_emb(q, k, cos_p, sin_p, head_dim // 2)
+        print(f"Q rotated (partial) shape: {q_rot_p.shape}")
 
-    print("\nTriton RoPE working!")
+        print("\nTriton RoPE working!")
