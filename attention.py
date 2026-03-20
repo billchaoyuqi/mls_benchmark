@@ -22,14 +22,20 @@ def get_stream():
 
 @triton.autotune(
     configs=[
-        # 针对长序列的配置 (Prefill)
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
-        # 针对中等序列的配置
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
-        # 针对极短序列的配置 (Decode 阶段 M=1)
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=2),
+        # Prefill: large tiles, more pipeline stages
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64},  num_warps=8, num_stages=2),
+        # Medium sequences
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32},  num_warps=4, num_stages=2),
+        # Decode (small Seq_Q)
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32},  num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16},  num_warps=2, num_stages=2),
     ],
-    key=['Seq_Q', 'Seq_K'], # 当序列长度变化时触发重新调优
+    key=['Seq_Q', 'Seq_K'],
 )
 @triton.jit
 def flash_attn_fused_kernel(
@@ -77,7 +83,7 @@ def flash_attn_fused_kernel(
         k = tl.load(curr_k_ptrs, mask=((start_n + offs_n)[:, None] < Seq_K) & (offs_d[None, :] < Head_Dim), other=0.0)
 
         # Q @ K^T
-        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        qk = tl.dot(q, tl.trans(k), input_precision="tf32") * sm_scale
 
         # 边界掩码
         qk = tl.where((start_n + offs_n)[None, :] < Seq_K, qk, -float('inf'))
@@ -100,7 +106,7 @@ def flash_attn_fused_kernel(
         v = tl.load(curr_v_ptrs, mask=((start_n + offs_n)[:, None] < Seq_K) & (offs_d[None, :] < Head_Dim), other=0.0)
 
         # 累加 Attention Output
-        acc += tl.dot(p.to(v.dtype), v)
+        acc += tl.dot(p.to(v.dtype), v, input_precision="tf32")
 
         # 更新统计量
         l_i = l_i * alpha + l_ij
@@ -250,13 +256,9 @@ def mha_rope_torch(
 
     half_dim = rotary_dim // 2
 
-    # Support both full [seq, rotary_dim] and half [seq, half_dim] cos/sin inputs
-    if cos.shape[-1] > half_dim:
-        cos_h = cos[..., :half_dim].float()
-        sin_h = sin[..., :half_dim].float()
-    else:
-        cos_h = cos.float()
-        sin_h = sin.float()
+    # cos/sin are [seq, half_dim] (non-duplicated cache format).
+    cos_h = cos.float() if cos.dtype != torch.float32 else cos
+    sin_h = sin.float() if sin.dtype != torch.float32 else sin
 
     def rotate(x: torch.Tensor) -> torch.Tensor:
         """Apply RoPE rotation to a single Q or K tensor."""
@@ -298,9 +300,15 @@ def mha_rope_torch(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64},  num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32},  num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16},  num_warps=2, num_stages=2),
     ],
     key=['Seq_Q', 'Seq_K'],
 )
@@ -434,14 +442,15 @@ def flash_attn_rope_fused_kernel(
 
         # QK^T computed in two (or three) tile-matmul pieces
         # Each piece: [BLOCK_M, BLOCK_R] @ [BLOCK_R, BLOCK_N]
-        qk = tl.dot(q1_rot, tl.trans(k1_rot)) + tl.dot(q2_rot, tl.trans(k2_rot))
+        qk = tl.dot(q1_rot, tl.trans(k1_rot), input_precision="tf32") + \
+             tl.dot(q2_rot, tl.trans(k2_rot), input_precision="tf32")
 
         if HAS_PASS:
             k_pass = tl.load(
                 k_base + (start_n + offs_n)[:, None] * stride_kn + offs_pass[None, :] * stride_kd,
                 mask=n_mask[:, None] & (offs_pass[None, :] < Head_Dim), other=0.0,
             ).to(tl.float32)
-            qk += tl.dot(q_pass, tl.trans(k_pass))
+            qk += tl.dot(q_pass, tl.trans(k_pass), input_precision="tf32")
 
         qk *= sm_scale
 
@@ -465,7 +474,7 @@ def flash_attn_rope_fused_kernel(
             v_base + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vd,
             mask=n_mask[:, None] & (offs_d[None, :] < Head_Dim), other=0.0,
         ).to(tl.float32)
-        acc += tl.dot(p.to(v.dtype), v)
+        acc += tl.dot(p.to(v.dtype), v, input_precision="tf32")
 
         l_i = l_i * alpha + l_ij
         m_i = m_next
@@ -535,11 +544,11 @@ def scaled_dot_product_attention_with_rope(
     k = k.to(torch.float32).contiguous()
     v = v.to(torch.float32).contiguous()
 
-    # cos/sin cache is stored doubled [seq, rotary_dim]; we only need the
-    # first half_dim columns (the second half is identical to the first).
+    # cos/sin are now [seq, half_dim] (non-duplicated cache format).
+    # .to(fp32) is usually a no-op; .contiguous() is a no-op on the row-slice.
     half_dim = rotary_dim // 2
-    cos_half = cos[:, :half_dim].to(torch.float32).contiguous()  # [seq, half_dim]
-    sin_half = sin[:, :half_dim].to(torch.float32).contiguous()
+    cos_half = cos.to(torch.float32).contiguous()
+    sin_half = sin.to(torch.float32).contiguous()
 
     output = torch.empty_like(q)
     head_dim_padded = next_power_of_two(head_dim)

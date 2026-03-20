@@ -92,17 +92,29 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 # --- Autotuned Linear Kernel ---
 @triton.autotune(
     configs=[
+        # Prefill / large-batch (big M)
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=4, num_stages=3),
+        # Small-M (decode, M≈1-64)
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        # Fallback
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16,  'BLOCK_K': 32}, num_warps=2, num_stages=2),
     ],
     key=['M', 'N', 'K'],
 )
 @triton.jit
 def linear_kernel_tf32(
-        a_ptr, b_ptr, c_ptr, M, N, K,
+        a_ptr, b_ptr, bias_ptr, c_ptr, M, N, K,
         stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        HAS_BIAS: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -117,7 +129,11 @@ def linear_kernel_tf32(
                     mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K), other=0.0)
         b = tl.load(b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
                     mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
+        acc += tl.dot(a, b, input_precision="tf32")
+    # Fuse bias add — eliminates a separate elementwise kernel launch
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
     tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
              acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
@@ -125,17 +141,24 @@ def linear_kernel_tf32(
 # --- Autotuned Linear+GELU Kernel ---
 @triton.autotune(
     configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16,  'BLOCK_K': 32}, num_warps=2, num_stages=2),
     ],
     key=['M', 'N', 'K'],
 )
 @triton.jit
 def linear_gelu_kernel(
-        a_ptr, b_ptr, c_ptr, M, N, K,
+        a_ptr, b_ptr, bias_ptr, c_ptr, M, N, K,
         stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        HAS_BIAS: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -150,8 +173,11 @@ def linear_gelu_kernel(
                     mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K), other=0.0)
         b = tl.load(b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
                     mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
-
+        acc += tl.dot(a, b, input_precision="tf32")
+    # Fuse bias before activation — eliminates a separate elementwise kernel launch
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
     sqrt_2_over_pi = 0.7978845608028654
     acc3 = acc * acc * acc
     inner = sqrt_2_over_pi * (acc + 0.044715 * acc3)
@@ -164,10 +190,16 @@ def linear_gelu_kernel(
 # --- Autotuned SwiGLU Fused Kernel ---
 @triton.autotune(
     configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16,  'BLOCK_K': 32}, num_warps=2, num_stages=2),
     ],
     key=['M', 'N', 'K'],
 )
@@ -193,8 +225,8 @@ def swiglu_fused_kernel(
                          mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
         up_w = tl.load(up_ptr + (k + offs_k[:, None]) * stride_uk + offs_n[None, :] * stride_un,
                        mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        gate_acc += tl.dot(a, gate_w)
-        up_acc += tl.dot(a, up_w)
+        gate_acc += tl.dot(a, gate_w, input_precision="tf32")
+        up_acc += tl.dot(a, up_w, input_precision="tf32")
 
     sigmoid = 1.0 / (1.0 + tl.exp(-gate_acc))
     gate_act = gate_acc * sigmoid
@@ -395,28 +427,32 @@ class Linear:
         M = int(np.prod(batch_dims))
         K = self.in_features
         N = self.out_features
-        x_2d = x.reshape(M, K).to(torch.float32).contiguous()
+        # Avoid redundant copy: only call .contiguous() when actually needed.
+        x_2d = x.reshape(M, K)
+        if x_2d.dtype != torch.float32 or not x_2d.is_contiguous():
+            x_2d = x_2d.to(torch.float32).contiguous()
         self._ensure_weight_prepared(x.device)
         output = torch.empty((M, N), dtype=torch.float32, device=x.device)
+
+        has_bias = self.has_bias and self.bias_param is not None
+        if has_bias and self.bias_param.device != x.device:
+            self.bias_param = self.bias_param.to(x.device)
 
         grid = lambda META: (
             triton.cdiv(M, META['BLOCK_M']),
             triton.cdiv(N, META['BLOCK_N']),
         )
+        # bias_ptr: pass bias tensor when HAS_BIAS, else pass output as dummy (never read)
         linear_kernel_tf32[grid](
-            x_2d, self._weight_t_padded, output,
+            x_2d, self._weight_t_padded,
+            self.bias_param if has_bias else output,
+            output,
             M, N, K,
             x_2d.stride(0), x_2d.stride(1),
             self._weight_t_padded.stride(0), self._weight_t_padded.stride(1),
             output.stride(0), output.stride(1),
+            HAS_BIAS=has_bias,
         )
-
-        if not self._printed_autotune and linear_kernel_tf32.best_config is not None:
-            print(f"[Autotune] Linear Kernel for M={M}, N={N}, K={K} selected config: {linear_kernel_tf32.best_config}")
-            self._printed_autotune = True
-
-        if self.has_bias and self.bias_param is not None:
-            output += self.bias_param.to(x.device)
         return output.reshape(*batch_dims, self.out_features)
 
 
@@ -485,14 +521,9 @@ class MLP:
 
     def _prepare_fused_weights(self, device):
         if self._gate_weight_t is None or self._gate_weight_t.device != device:
-            K, N = self.hidden_size, self.intermediate_size
-            # 简化填充，直接对齐内存块
-            gw = torch.zeros((K, N), dtype=torch.float32, device=device)
-            uw = torch.zeros((K, N), dtype=torch.float32, device=device)
-            gw[:K, :N] = self.gate_proj.weight.t()
-            uw[:K, :N] = self.up_proj.weight.t()
-            self._gate_weight_t = gw
-            self._up_weight_t = uw
+            # Direct transpose + device move — no torch.zeros allocation + copy.
+            self._gate_weight_t = self.gate_proj.weight.t().to(device).contiguous()
+            self._up_weight_t   = self.up_proj.weight.t().to(device).contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_gating and MLP.FUSED and x.is_cuda:
@@ -502,7 +533,9 @@ class MLP:
     def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
         self._prepare_fused_weights(x.device)
         orig_shape = x.shape
-        x_2d = x.reshape(-1, self.hidden_size).to(torch.float32).contiguous()
+        x_2d = x.reshape(-1, self.hidden_size)
+        if x_2d.dtype != torch.float32 or not x_2d.is_contiguous():
+            x_2d = x_2d.to(torch.float32).contiguous()
         M = x_2d.shape[0]
         K = self.hidden_size
         N = self.intermediate_size
@@ -521,12 +554,6 @@ class MLP:
             self._up_weight_t.stride(0), self._up_weight_t.stride(1),
             intermediate.stride(0), intermediate.stride(1),
         )
-
-        if not self._printed_autotune and swiglu_fused_kernel.best_config is not None:
-            print(
-                f"[Autotune] SwiGLU Kernel for M={M}, N={N}, K={K} selected config: {swiglu_fused_kernel.best_config}")
-            self._printed_autotune = True
-
         return self.down_proj(intermediate.reshape(*orig_shape[:-1], N))
 
 
@@ -547,11 +574,8 @@ class EncoderMLP:
 
     def _prepare_fused_weights(self, device):
         if self._fc1_weight_t is None or self._fc1_weight_t.device != device:
-            K = self.hidden_size
-            N = self.intermediate_size
-            w_pad = torch.zeros((K, N), dtype=torch.float32, device=device)
-            w_pad[:K, :N] = self.fc1.weight.t()
-            self._fc1_weight_t = w_pad
+            # Direct transpose + device move — no torch.zeros allocation + copy.
+            self._fc1_weight_t = self.fc1.weight.t().to(device).contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda:
@@ -564,10 +588,16 @@ class EncoderMLP:
     def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
         self._prepare_fused_weights(x.device)
         orig_shape = x.shape
-        x_2d = x.reshape(-1, self.hidden_size).to(torch.float32).contiguous()
+        x_2d = x.reshape(-1, self.hidden_size)
+        if x_2d.dtype != torch.float32 or not x_2d.is_contiguous():
+            x_2d = x_2d.to(torch.float32).contiguous()
         M = x_2d.shape[0]
         K = self.hidden_size
         N = self.intermediate_size
+
+        has_bias = self.bias_enabled and self.fc1.bias_param is not None
+        if has_bias and self.fc1.bias_param.device != x.device:
+            self.fc1.bias_param = self.fc1.bias_param.to(x.device)
 
         intermediate = torch.empty((M, N), dtype=torch.float32, device=x.device)
 
@@ -576,19 +606,13 @@ class EncoderMLP:
             triton.cdiv(N, META['BLOCK_N']),
         )
         linear_gelu_kernel[grid](
-            x_2d, self._fc1_weight_t, intermediate,
+            x_2d, self._fc1_weight_t,
+            self.fc1.bias_param if has_bias else intermediate,
+            intermediate,
             M, N, K,
             x_2d.stride(0), x_2d.stride(1),
             self._fc1_weight_t.stride(0), self._fc1_weight_t.stride(1),
             intermediate.stride(0), intermediate.stride(1),
+            HAS_BIAS=has_bias,
         )
-
-        if not self._printed_autotune and linear_gelu_kernel.best_config is not None:
-            print(
-                f"[Autotune] Linear+GELU Kernel for M={M}, N={N}, K={K} selected config: {linear_gelu_kernel.best_config}")
-            self._printed_autotune = True
-
-        if self.bias_enabled and self.fc1.bias_param is not None:
-            intermediate += self.fc1.bias_param.to(x.device)
-
         return self.fc2(intermediate.reshape(*orig_shape[:-1], self.intermediate_size))
