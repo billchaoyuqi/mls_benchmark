@@ -351,8 +351,7 @@ class Linear:
         self.bias_param = torch.zeros(out_features, dtype=torch.float32) if bias else None
         self._weight_t_padded = None
 
-        # 记录是否打印过调优结果
-        self._printed_autotune = False
+        self._printed_autotune = True  # suppress autotune noise
 
     def _ensure_weight_prepared(self, device):
         if self._weight_t_padded is None or self._weight_t_padded.device != device:
@@ -482,7 +481,7 @@ class MLP:
         self.down_proj = Linear(intermediate_size, hidden_size, bias=bias)
         self._gate_weight_t = None
         self._up_weight_t = None
-        self._printed_autotune = False
+        self._printed_autotune = True  # suppress autotune noise
 
     def _prepare_fused_weights(self, device):
         if self._gate_weight_t is None or self._gate_weight_t.device != device:
@@ -544,7 +543,7 @@ class EncoderMLP:
         self.bias_enabled = bias
         self.activation = activation
         self._fc1_weight_t = None
-        self._printed_autotune = False
+        self._printed_autotune = True  # suppress autotune noise
 
     def _prepare_fused_weights(self, device):
         if self._fc1_weight_t is None or self._fc1_weight_t.device != device:
